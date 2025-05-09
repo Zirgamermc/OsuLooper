@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>osu! Map & Audio Repeater</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.0/lame.min.js"></script>
+  <style>
+    body {
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      margin: 0;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    .container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: #222;
+      padding: 30px;
+      border-radius: 10px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.5);
+    }
+    h1 {
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    input, button {
+      margin: 10px 0;
+      padding: 10px 20px;
+      font-size: 1rem;
+      border: none;
+      border-radius: 5px;
+    }
+    input[type="file"], input[type="number"] {
+      background: #333;
+      color: #eee;
+    }
+    button {
+      background: #28a745;
+      color: #fff;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    button:hover {
+      background: #218838;
+    }
+    progress {
+      width: 100%;
+      height: 16px;
+      margin-top: 10px;
+      appearance: none;
+    }
+    progress::-webkit-progress-bar {
+      background: #444;
+      border-radius: 4px;
+    }
+    progress::-webkit-progress-value {
+      background: #28a745;
+      border-radius: 4px;
+    }
+    progress::-moz-progress-bar {
+      background: #28a745;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>osu! Map & Audio Repeater</h1>
+    <input type="file" id="fileInput" accept=".osz">
+    <input type="number" id="repeatCount" placeholder="Repetitions" min="1" value="2">
+    <button id="processBtn">Process .osz</button>
+    <progress id="progressBar" value="0" max="100" style="display:none;"></progress>
+  </div>
+
+  <script>
+    document.getElementById('processBtn').addEventListener('click', async () => {
+      const fileEl = document.getElementById('fileInput');
+      const repeats = parseInt(document.getElementById('repeatCount').value, 10);
+      const progressBar = document.getElementById('progressBar');
+      if (!fileEl.files.length || isNaN(repeats) || repeats < 1) {
+        alert('Select a .osz and enter a valid repetition count.');
+        return;
+      }
+
+      progressBar.style.display = 'block';
+      progressBar.value = 10;
+
+      const file = fileEl.files[0];
+      const ab = await file.arrayBuffer();
+      progressBar.value = 20;
+
+      const zip = await JSZip.loadAsync(ab);
+      const newZip = new JSZip();
+      progressBar.value = 30;
+
+      let originalDurationMs = 0, mp3Array = null;
+      for (const path in zip.files) {
+        if (path.endsWith('.mp3')) {
+          const origAB = await zip.files[path].async('arraybuffer');
+          progressBar.value = 40;
+          const { repeatedAB, origDurationMs } = await repeatMp3Multiple(origAB, repeats);
+          mp3Array = new Uint8Array(repeatedAB);
+          originalDurationMs = origDurationMs;
+          progressBar.value = 60;
+          break;
+        }
+      }
+
+      const paths = Object.keys(zip.files);
+      for (let i = 0; i < paths.length; i++) {
+        const path = paths[i];
+        const entry = zip.files[path];
+        if (path.endsWith('.osu')) {
+          const txt = await entry.async('string');
+          const mod = modifyOsu(path, txt, repeats, originalDurationMs);
+          const newPath = path.replace('.osu', ` [x${repeats}].osu`);
+          newZip.file(newPath, mod);
+        } else if (path.endsWith('.mp3') && mp3Array) {
+          newZip.file(path, mp3Array, { binary: true });
+        } else {
+          const data = await entry.async('arraybuffer');
+          newZip.file(path, data, { binary: true });
+        }
+        progressBar.value = 60 + ((i + 1) / paths.length) * 30;
+      }
+
+      progressBar.value = 95;
+      const base = file.name.replace(/\.osz$/i, '');
+      const blob = await newZip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `${base} [x${repeats}].osz`;
+      a.click();
+
+      progressBar.value = 100;
+      setTimeout(() => progressBar.style.display = 'none', 800);
+    });
+
+    function modifyOsu(path, content, repeats, originalDurationMs) {
+      const lines = content.split('\n');
+      const vI = lines.findIndex(l => l.startsWith('Version:'));
+      if (vI >= 0) {
+        const orig = lines[vI].substring(8).trim();
+        lines[vI] = `Version: ${orig} [x${repeats}]`;
+      }
+
+      const timingStart = lines.findIndex(l => l.trim() === '[TimingPoints]');
+      const hitStart = lines.findIndex(l => l.trim() === '[HitObjects]');
+      if (timingStart < 0 || hitStart < 0) return content;
+
+      const timingPoints = [];
+      for (let i = timingStart + 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line === '' || line.startsWith('[')) break;
+        const parts = line.split(',');
+        const time = parseFloat(parts[0]);
+        timingPoints.push({ line, time });
+      }
+
+      const hitObjects = lines.slice(hitStart + 1).filter(l => l.trim());
+      const parsedHitObjects = hitObjects.map(l => {
+        const p = l.split(',');
+        const type = parseInt(p[3], 10);
+        return {
+          line: l,
+          time: parseInt(p[2], 10),
+          endTime: type & 8 ? parseInt(p[5], 10) : null
+        };
+      });
+
+      const lastObjectTime = Math.max(...parsedHitObjects.map(o => o.endTime || o.time));
+      const usedTimingPoints = timingPoints.filter(tp => tp.time <= lastObjectTime + 10);
+
+      const outTiming = [];
+      const outHitObjects = [];
+
+      for (let i = 0; i < repeats; i++) {
+        const shift = Math.round(originalDurationMs * i);
+        usedTimingPoints.forEach(tp => {
+          const parts = tp.line.split(',');
+          parts[0] = (tp.time + shift).toString();
+          outTiming.push(parts.join(','));
+        });
+        parsedHitObjects.forEach(h => {
+          const p = h.line.split(',');
+          p[2] = (h.time + shift).toString();
+          if (h.endTime !== null) p[5] = (h.endTime + shift).toString();
+          outHitObjects.push(p.join(','));
+        });
+      }
+
+      const beforeTiming = lines.slice(0, timingStart + 1);
+      const afterTiming = lines.slice(hitStart); // includes '[HitObjects]'
+
+      return [
+        ...beforeTiming,
+        ...outTiming,
+        '',
+        afterTiming[0], // '[HitObjects]'
+        ...outHitObjects
+      ].join('\n');
+    }
+
+    async function repeatMp3Multiple(arrayBuffer, repeats) {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+      const sr = decoded.sampleRate, ch = decoded.numberOfChannels;
+      const origLen = decoded.length;
+      const origDurationMs = decoded.duration * 1000;
+      const totalLen = origLen * repeats;
+
+      const off = new OfflineAudioContext(ch, totalLen, sr);
+      for (let i = 0; i < repeats; i++) {
+        const src = off.createBufferSource();
+        src.buffer = decoded;
+        src.connect(off.destination);
+        src.start(i * decoded.duration);
+      }
+      const rendered = await off.startRendering();
+
+      const to16 = f => {
+        const out = new Int16Array(f.length);
+        for (let i = 0; i < f.length; i++) {
+          const s = Math.max(-1, Math.min(1, f[i]));
+          out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return out;
+      };
+      const left = to16(rendered.getChannelData(0));
+      const right = ch > 1 ? to16(rendered.getChannelData(1)) : left;
+
+      const enc = new lamejs.Mp3Encoder(ch, sr, 128);
+      const blk = 1152, parts = [];
+      for (let i = 0; i < left.length; i += blk) {
+        const l = left.subarray(i, i + blk);
+        const r = ch > 1 ? right.subarray(i, i + blk) : undefined;
+        const buf = ch > 1 ? enc.encodeBuffer(l, r) : enc.encodeBuffer(l);
+        if (buf.length) parts.push(new Uint8Array(buf));
+      }
+      const tail = enc.flush();
+      if (tail.length) parts.push(new Uint8Array(tail));
+
+      const blob = new Blob(parts, { type: 'audio/mpeg' });
+      const repeatedAB = await blob.arrayBuffer();
+      return { repeatedAB, origDurationMs };
+    }
+  </script>
+</body>
+</html>
